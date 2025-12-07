@@ -1,0 +1,11 @@
+__pycache__/
+*.csv
+*.log
+*.pt
+*.pkl
+wandb/
+atari-data/
+dt_runs/
+test/
+scripts/data/*.pkl
+scripts/data/data
