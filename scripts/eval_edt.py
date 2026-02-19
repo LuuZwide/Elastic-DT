@@ -181,6 +181,7 @@ def test(args,step,eval_chk_pt_name):
             real_rtg=real_rtg,
             render=render,
             heuristic=args.heuristic,
+            target_heuristic=args.target_heuristic,
             heuristic_delta=args.heuristic_delta,
         )
         tf = time.time()
@@ -239,6 +240,7 @@ def test(args,step,eval_chk_pt_name):
                     real_rtg=real_rtg,
                     render=render,
                     heuristic=args.heuristic,
+                    target_heuristic=args.target_heuristic,
                     heuristic_delta=args.heuristic_delta,
                 )
                 try:
@@ -248,7 +250,7 @@ def test(args,step,eval_chk_pt_name):
 
                 normalised_results = get_d4rl_normalized_score(eval_results['eval/avg_reward'], env_d4rl_name) * 100
                 score_mean_gms.append(normalised_results)
-                lengths_gm.append(eval_results['eval/length'])
+                lengths_gm.append(eval_results['eval/avg_ep_len'])
 
             mean_scores, std_scores = np.mean(score_mean_gms), np.std(score_mean_gms)
             mean_length, std_length = np.mean(lengths_gm), np.std(lengths_gm)

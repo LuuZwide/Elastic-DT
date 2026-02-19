@@ -323,7 +323,7 @@ def train(args):
                 )
 
             optimizer.zero_grad()
-            scaler.scale(edt_loss).backward()
+            scaler.scale(edt_loss).backward() #Scale the loss to prevent gradient underflow for float16
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 0.25)
             scaler.step(optimizer)
