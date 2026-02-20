@@ -77,6 +77,7 @@ def base_parse():
             default='edt_hopper-medium-replay-v2_model_23-03-06-01-28-21_best.pt')
     parser.add_argument('--render', default=False)
     parser.add_argument('--heuristic', default=False)
+    parser.add_argument('--target_heuristic', default=False)
     parser.add_argument('--heuristic_delta', type=int, default=1)
 
     args = parser.parse_args()
@@ -171,6 +172,7 @@ def encode_return(env_name, ret, scale=1.0, num_bin=120, rtg_scale=1000):
         ret_min = -20
     else:
         ret_min = REF_MIN_SCORE[env_key]
+
     ret_max /= rtg_scale
     ret_min /= rtg_scale
     interval = (ret_max - ret_min) / (num_bin-1)
@@ -223,6 +225,22 @@ def expert_sampling(
         logits + expert_weight * expert_logits, temperature, top_percentile
     )
 
+def target_return_sampling(
+    logits: torch.Tensor,
+    target_return_bin: int,  
+    temperature: Optional[float] = 1e0,
+    top_percentile: Optional[float] = None,
+    target_weight: Optional[float] = 10,
+) -> torch.Tensor:
+    B, T, num_bin = logits.shape
+    device = logits.device
+    
+    bin_indices = torch.arange(num_bin, device=device).repeat(B, T, 1)
+    target_logits = -torch.abs(bin_indices - target_return_bin)
+    
+    return sample_from_logits(
+        logits + target_weight * target_logits, temperature, top_percentile
+    )
 
 def mgdt_logits(
     logits: torch.Tensor, opt_weight: Optional[int] = 10
@@ -253,6 +271,7 @@ def edt_evaluate(
     rs_ratio=1,
     real_rtg=False,
     heuristic=False,
+    target_heuristic=False,
     heuristic_delta=1,
     *args, 
     **kwargs
@@ -339,7 +358,7 @@ def edt_evaluate(
                 rewards_to_go[0, t] = running_rtg
                 rewards[0, t] = running_reward
 
-                if not heuristic:
+                if not heuristic and not target_heuristic:
                     act, best_index = _return_search(
                         model=model,
                         timesteps=timesteps,
@@ -359,7 +378,8 @@ def edt_evaluate(
                         rs_ratio=rs_ratio,
                         real_rtg=real_rtg
                     )
-                else:
+                elif heuristic and not target_heuristic:
+                    # print('heuristic return search')
                     act, best_index = _return_search_heuristic(
                         model=model,
                         timesteps=timesteps,
@@ -367,6 +387,7 @@ def edt_evaluate(
                         actions=actions,
                         rewards_to_go=rewards_to_go,
                         rewards=rewards,
+                        rtg_target=rtg_target,
                         context_len=context_len,
                         t=t,
                         env_name=env_name,
@@ -382,9 +403,33 @@ def edt_evaluate(
                         previous_index=previous_index,
                     )
                     previous_index = best_index
+                elif target_heuristic and not heuristic:
+                    # print('heuristic return search')
+                    act, best_index = _target_return_search_heuristic(
+                        model=model,
+                        timesteps=timesteps,
+                        states=states,
+                        actions=actions,
+                        rewards_to_go=rewards_to_go,
+                        rewards=rewards,
+                        rtg_target=rtg_target,
+                        context_len=context_len,
+                        t=t,
+                        env_name=env_name,
+                        top_percentile=top_percentile,
+                        num_bin=num_bin,
+                        rtg_scale=rtg_scale,
+                        expert_weight=expert_weight,
+                        mgdt_sampling=mgdt_sampling,
+                        rs_steps=rs_steps,
+                        rs_ratio=rs_ratio,
+                        real_rtg=real_rtg,
+                        heuristic_delta=heuristic_delta,
+                        previous_index=previous_index,
+                    )
+                    previous_index = best_index
+
                 indices.append(best_index)
-
-
                 running_state, running_reward, done, _ = env.step(
                     act.cpu().numpy()
                 )
@@ -558,6 +603,7 @@ def _return_search_heuristic(
     actions,
     rewards_to_go,
     rewards,
+    rtg_target,
     context_len,
     t,
     env_name,
@@ -591,6 +637,7 @@ def _return_search_heuristic(
                 rewards[:, i : context_len + i],
             )
 
+            #convert to tensor rtg_target = torch.tensor(rtg.target).to(device) --- IGNORE ---
             if mgdt_sampling:
                 opt_rtg = decode_return(
                     env_name,
@@ -611,6 +658,7 @@ def _return_search_heuristic(
                     opt_rtg,
                     rewards[:, i : context_len + i],
                 )
+                print('opt_rtg : ', opt_rtg)
 
             else:
                 _, act_preds, ret_preds, imp_ret_preds_pure, _ = model.forward(
@@ -689,6 +737,159 @@ def _return_search_heuristic(
 
     return best_act, context_len - best_i
 
+def _target_return_search_heuristic(
+    model,
+    timesteps,
+    states,
+    actions,
+    rewards_to_go,
+    rewards,
+    rtg_target,
+    context_len,
+    t,
+    env_name,
+    top_percentile,
+    num_bin,
+    rtg_scale,
+    expert_weight,
+    mgdt_sampling=False,
+    rs_steps=2,
+    rs_ratio=1,
+    real_rtg=False,
+    heuristic_delta=1,
+    previous_index=None,
+    *args, 
+    **kwargs
+):
+    # B x T x 1?
+    closest_return = -999
+    estimated_rtg = None
+    best_i = 0
+    best_act = None
+
+    if t < context_len:
+        for i in range(0, math.ceil((t + 1)/rs_ratio), rs_steps):
+            _, act_preds, ret_preds, imp_ret_preds, _ = model.forward(
+                timesteps[:, i : context_len + i],
+                states[:, i : context_len + i],
+                actions[:, i : context_len + i],
+                rewards_to_go[:, i : context_len + i],
+                rewards[:, i : context_len + i],
+            )
+            
+            if mgdt_sampling:
+                rtg_target_bin = encode_return(env_name, torch.tensor(rtg_target / rtg_scale).to(ret_preds.device), scale=rtg_scale, num_bin=num_bin, rtg_scale=rtg_scale).int() 
+                opt_rtg = decode_return(
+                    env_name,
+                    target_return_sampling(
+                        mgdt_logits(ret_preds),
+                        target_return_bin=rtg_target_bin,
+                        top_percentile=top_percentile,
+                        target_weight=expert_weight,
+                    ),
+                    num_bin=num_bin,
+                    rtg_scale=rtg_scale,
+                )
+                # print('opt_rtg : ', opt_rtg)
+
+                # we should estimate it again with the estimated rtg
+                _, act_preds, ret_preds, imp_ret_preds_pure, _ = model.forward(
+                    timesteps[:, i : context_len + i],
+                    states[:, i : context_len + i],
+                    actions[:, i : context_len + i],
+                    opt_rtg,
+                    rewards[:, i : context_len + i],
+                )
+                # print('act_preds : ', act_preds)
+                # print('ret_preds : ', ret_preds)
+                # print('imp_ret_preds : ', imp_ret_preds_pure)
+
+            else:
+                _, act_preds, ret_preds, imp_ret_preds_pure, _ = model.forward(
+                    timesteps[:, i : context_len + i],
+                    states[:, i : context_len + i],
+                    actions[:, i : context_len + i],
+                    imp_ret_preds,
+                    rewards[:, i : context_len + i],
+                )
+
+            if not real_rtg:
+                imp_ret_preds = imp_ret_preds_pure
+
+            ret_i = imp_ret_preds[:, t - i].detach().item()
+            # print('ret_i : ', ret_i)
+            # difference between predicted return and target return
+            diff = abs(ret_i - rtg_target / rtg_scale)
+            
+            if diff < closest_return or closest_return == -999:
+                closest_return = diff
+                highest_ret = ret_i
+                best_i = i
+                estimated_rtg = imp_ret_preds.detach()
+                best_act = act_preds[0, t - i].detach()
+
+
+    else: # t >= context_len
+        prev_best_index = context_len - previous_index
+
+        for i in range(prev_best_index-heuristic_delta, prev_best_index+1+heuristic_delta):
+            if i < 0 or i >= context_len:
+                continue
+            _, act_preds, ret_preds, imp_ret_preds, _ = model.forward(
+                timesteps[:, t - context_len + 1 + i : t + 1 + i],
+                states[:, t - context_len + 1 + i : t + 1 + i],
+                actions[:, t - context_len + 1 + i : t + 1 + i],
+                rewards_to_go[:, t - context_len + 1 + i : t + 1 + i],
+                rewards[:, t - context_len + 1 + i : t + 1 + i],
+            )
+
+            # first sample return with optimal weight
+            if mgdt_sampling:
+                rtg_target_bin = encode_return(env_name, torch.tensor(rtg_target / rtg_scale).to(ret_preds.device), scale=rtg_scale, num_bin=num_bin, rtg_scale=rtg_scale).int()
+                opt_rtg = decode_return(
+                    env_name,
+                    target_return_sampling(
+                        mgdt_logits(ret_preds),
+                        target_return_bin=rtg_target_bin,
+                        top_percentile=top_percentile,
+                        target_weight=expert_weight,
+                    ),
+                    num_bin=num_bin,
+                    rtg_scale=rtg_scale,
+                )
+
+                # we should estimate the results again with the estimated return
+                _, act_preds, ret_preds, imp_ret_preds_pure, _ = model.forward(
+                    timesteps[:, t - context_len + 1 + i : t + 1 + i],
+                    states[:, t - context_len + 1 + i : t + 1 + i],
+                    actions[:, t - context_len + 1 + i : t + 1 + i],
+                    opt_rtg,
+                    rewards[:, t - context_len + 1 + i : t + 1 + i],
+                )
+
+            else:
+                _, act_preds, ret_preds, imp_ret_preds_pure, _ = model.forward(
+                    timesteps[:, t - context_len + 1 + i : t + 1 + i],
+                    states[:, t - context_len + 1 + i : t + 1 + i],
+                    actions[:, t - context_len + 1 + i : t + 1 + i],
+                    imp_ret_preds,
+                    rewards[:, t - context_len + 1 + i : t + 1 + i],
+                )
+
+            if not real_rtg:
+                imp_ret_preds = imp_ret_preds_pure
+
+            ret_i = imp_ret_preds[:, -1 - i].detach().item()
+            diff = abs(ret_i - rtg_target / rtg_scale)
+            if diff < closest_return or closest_return == -999:
+                closest_return = diff
+                highest_ret = ret_i
+                best_i = i
+                estimated_rtg = imp_ret_preds.detach()
+                best_act = act_preds[0, -1 - i].detach()
+
+
+    return best_act, context_len - best_i
 
 def evaluate_on_env(
     model,

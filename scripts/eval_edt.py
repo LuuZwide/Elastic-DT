@@ -300,9 +300,10 @@ if __name__ == "__main__":
     cfg = OmegaConf.load(config_file)
     cfg.merge_with_dotlist([f"{k}={v}" for k, v in vars(args).items() if v is not None])
 
-
+    # heurist, non_heuristic, target_heuristic 
+    heuristic_str = "heuristic" if args.heuristic and not args.target_heuristic else "target_heuristic" if args.target_heuristic and not args.heuristic else "non_heuristic"
     wandb.init(project=args.project_name,
-                name= "EDT_"+args.env+"_"+args.dataset, 
+                name= "EDT_"+args.env+"_"+args.dataset + "_eval_"+heuristic_str,  
                 config=OmegaConf.to_container(cfg, resolve=True))
 
     for dataset,ckpts in eval_chk_pt_group.items():
