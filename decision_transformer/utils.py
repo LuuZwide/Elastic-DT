@@ -658,8 +658,7 @@ def _return_search_heuristic(
                     opt_rtg,
                     rewards[:, i : context_len + i],
                 )
-                print('opt_rtg : ', opt_rtg)
-
+            
             else:
                 _, act_preds, ret_preds, imp_ret_preds_pure, _ = model.forward(
                     timesteps[:, i : context_len + i],
